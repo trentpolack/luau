@@ -177,6 +177,8 @@ LUA_API const LUA_VECTOR_TYPE* lua_tovector(lua_State* L, int idx);
 LUA_API int lua_toboolean(lua_State* L, int idx);
 LUA_API int64_t lua_tointeger64(lua_State* L, int idx, int* isinteger);
 LUA_API const char* lua_tolstring(lua_State* L, int idx, size_t* len);
+// As lua_tolstring, also giving the string table hash (the low 32 bits of XXH3_64bits); 0 when it returns NULL.
+LUA_API const char* lua_tolstringhashed(lua_State* L, int idx, size_t* len, unsigned int* hash);
 LUA_API const char* lua_tostringatom(lua_State* L, int idx, int* atom);
 LUA_API const char* lua_tolstringatom(lua_State* L, int idx, size_t* len, int* atom);
 LUA_API const char* lua_namecallatom(lua_State* L, int* atom);
@@ -206,6 +208,8 @@ LUA_API void lua_pushvector(lua_State* L, LUA_VECTOR_TYPE x, LUA_VECTOR_TYPE y, 
 LUA_API void lua_pushvector(lua_State* L, LUA_VECTOR_TYPE x, LUA_VECTOR_TYPE y, LUA_VECTOR_TYPE z);
 #endif
 LUA_API void lua_pushlstring(lua_State* L, const char* s, size_t l);
+// hash must be the low 32 bits of XXH3_64bits(s, l), the string table hash.
+LUA_API void lua_pushlstringhashed(lua_State* L, const char* s, size_t l, unsigned int hash);
 LUA_API void lua_pushstring(lua_State* L, const char* s);
 LUA_API const char* lua_pushvfstring(lua_State* L, const char* fmt, va_list argp);
 LUA_API LUA_PRINTF_ATTR(2, 3) const char* lua_pushfstringL(lua_State* L, const char* fmt, ...);
@@ -429,6 +433,9 @@ LUA_API int lua_getweakref(lua_State* L, int ref); // returns the type of the va
 LUA_API void lua_setuserdatametatable(lua_State* L, int tag);
 LUA_API void lua_getuserdatametatable(lua_State* L, int tag);
 
+LUA_API void lua_setlightuserdatametatable(lua_State* L, int tag);
+LUA_API void lua_getlightuserdatametatable(lua_State* L, int tag);
+
 // Returns the name of a userdata tag - `__type` from the metatable or "userdata" if it is not set
 LUA_API const char* lua_getuserdataname(lua_State* L, int tag);
 
@@ -440,6 +447,15 @@ typedef void (*lua_UserdataDirectAccess)(lua_State* L, void* data, int atom, uin
 typedef int (*lua_UserdataDirectNamecall)(lua_State* L, void* data, int atom, uint16_t* cachedslot, int utag);
 
 LUA_API int lua_registeruserdatadirectaccess(
+    lua_State* L,
+    int tag,
+    lua_UserdataDirectAccess get,
+    lua_UserdataDirectAccess set,
+    lua_UserdataDirectNamecall namecall
+);
+
+// The same for a lightuserdata tag with a metatable from lua_setlightuserdatametatable; data is the pointer value.
+LUA_API int lua_registerlightuserdatadirectaccess(
     lua_State* L,
     int tag,
     lua_UserdataDirectAccess get,
@@ -473,6 +489,12 @@ LUA_API void lua_userdatadirectfield_setnil(void* result);
 
 LUA_API void lua_setlightuserdataname(lua_State* L, int tag, const char* name);
 LUA_API const char* lua_getlightuserdataname(lua_State* L, int tag);
+
+// Liveness checks for tagged lightuserdata: values whose check returns 0 evaluate as false in
+// boolean contexts (if/and/or/not/lua_toboolean). Equality, type() and table keys are unaffected.
+// The check runs inside the interpreter loop: it must not call into the VM, error, or allocate.
+typedef int (*lua_LightUserdataLiveness)(void* p);
+LUA_API void lua_setlightuserdatalivenesscheck(lua_State* L, int tag, lua_LightUserdataLiveness check);
 
 LUA_API void lua_clonefunction(lua_State* L, int idx);
 LUA_API int lua_usesexport(lua_State* L, int idx);
@@ -645,6 +667,11 @@ LUA_API lua_Callbacks* lua_callbacks(lua_State* L);
 // The VM makes no assumptions about the layout or structure of the caged heap
 // The VM does assume that the embedder will free any memory allocated if the main lua_State the cage is associated with is closed
 LUA_API void lua_setmemorycage(lua_State* L, lua_CageAlloc alloc, void* ud);
+
+// fn runs at most once, just before an error unwinds this thread, and must not call into the VM.
+// Clear it before returning or calling anything that can run Luau.
+LUA_API void lua_setprethrow(lua_State* L, void (*fn)(void*), void* data);
+LUA_API void lua_clearprethrow(lua_State* L);
 
 /******************************************************************************
  * Copyright (c) 2019-2023 Roblox Corporation

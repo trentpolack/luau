@@ -9,6 +9,7 @@
 #include "ltable.h"
 #include "lfunc.h"
 #include "lgc.h"
+#include "lmem.h"
 #include "ldo.h"
 #include "ltm.h"
 #include "ludata.h"
@@ -472,7 +473,7 @@ unsigned lua_tounsignedx(lua_State* L, int idx, int* isnum)
 int lua_toboolean(lua_State* L, int idx)
 {
     const TValue* o = index2addr(L, idx);
-    return !l_isfalse(o);
+    return !l_isfalseL(L, o);
 }
 
 int64_t lua_tointeger64(lua_State* L, int idx, int* isinteger)
@@ -510,6 +511,14 @@ const char* lua_tolstring(lua_State* L, int idx, size_t* len)
     if (len != NULL)
         *len = tsvalue(o)->len;
     return svalue(o);
+}
+
+const char* lua_tolstringhashed(lua_State* L, int idx, size_t* len, unsigned int* hash)
+{
+    const char* s = lua_tolstring(L, idx, len);
+    if (hash)
+        *hash = s ? tsvalue(index2addr(L, idx))->hash : 0;
+    return s;
 }
 
 const char* lua_tostringatom(lua_State* L, int idx, int* atom)
@@ -749,6 +758,17 @@ void lua_pushlstring(lua_State* L, const char* s, size_t len)
     api_incr_top(L);
 }
 
+void lua_pushlstringhashed(lua_State* L, const char* s, size_t len, unsigned int hash)
+{
+    api_check(L, s != nullptr);
+    api_check(L, hash == luaS_hash(s, len));
+    luaC_checkGC(L);
+    luaC_threadbarrier(L);
+    ensure_stack(L, 1);
+    setsvalue(L, L->top, luaS_newlstrhashed(L, s, len, hash));
+    api_incr_top(L);
+}
+
 void lua_pushstring(lua_State* L, const char* s)
 {
     if (s == NULL)
@@ -942,6 +962,9 @@ int lua_getmetatable(lua_State* L, int objindex)
         break;
     case LUA_TUSERDATA:
         mt = uvalue(obj)->metatable;
+        break;
+    case LUA_TLIGHTUSERDATA:
+        mt = luaE_lightuserdatamt(L->global, obj);
         break;
     case LUA_TOBJECT:
         mt = objectvalue(obj)->lclass->instancemetatable;
@@ -2045,6 +2068,34 @@ void lua_getuserdatametatable(lua_State* L, int tag)
     api_incr_top(L);
 }
 
+void lua_setlightuserdatametatable(lua_State* L, int tag)
+{
+    api_checknelems(L, 1);
+    api_check(L, unsigned(tag) < LUA_LUTAG_LIMIT);
+    api_check(L, !L->global->ludatamt[tag]); // reassignment not supported
+    api_check(L, ttistable(L->top - 1));
+    L->global->ludatamt[tag] = hvalue(L->top - 1);
+    L->top--;
+}
+
+void lua_getlightuserdatametatable(lua_State* L, int tag)
+{
+    api_check(L, unsigned(tag) < LUA_LUTAG_LIMIT);
+    luaC_threadbarrier(L);
+    ensure_stack(L, 1);
+
+    if (LuaTable* h = L->global->ludatamt[tag])
+    {
+        sethvalue(L, L->top, h);
+    }
+    else
+    {
+        setnilvalue(L->top);
+    }
+
+    api_incr_top(L);
+}
+
 const char* lua_getuserdataname(lua_State* L, int tag)
 {
     api_check(L, unsigned(tag) < LUA_UTAG_LIMIT);
@@ -2061,22 +2112,20 @@ const char* lua_getuserdataname(lua_State* L, int tag)
     return tname;
 }
 
-int lua_registeruserdatadirectaccess(
+static int registerdirectaccess(
     lua_State* L,
-    int tag,
+    LuaTable* h,
+    lua_UdataDirectAccessData& udatadirect,
     lua_UserdataDirectAccess get,
     lua_UserdataDirectAccess set,
     lua_UserdataDirectNamecall namecall
 )
 {
-    api_check(L, unsigned(tag) < LUA_UTAG_LIMIT);
     luaC_threadbarrier(L);
 
-    if (LuaTable* h = L->global->udatamt[tag])
+    if (h)
     {
         // only metamehtods that are present will be called directly
-        lua_UdataDirectAccessData& udatadirect = L->global->udatadirect[tag];
-
         if (const TValue* indextm = fasttm(L, h, TM_INDEX))
         {
             udatadirect.indextm = *indextm;
@@ -2101,6 +2150,41 @@ int lua_registeruserdatadirectaccess(
     return 0;
 }
 
+int lua_registeruserdatadirectaccess(
+    lua_State* L,
+    int tag,
+    lua_UserdataDirectAccess get,
+    lua_UserdataDirectAccess set,
+    lua_UserdataDirectNamecall namecall
+)
+{
+    api_check(L, unsigned(tag) < LUA_UTAG_LIMIT);
+    return registerdirectaccess(L, L->global->udatamt[tag], L->global->udatadirect[tag], get, set, namecall);
+}
+
+int lua_registerlightuserdatadirectaccess(
+    lua_State* L,
+    int tag,
+    lua_UserdataDirectAccess get,
+    lua_UserdataDirectAccess set,
+    lua_UserdataDirectNamecall namecall
+)
+{
+    api_check(L, unsigned(tag) < LUA_LUTAG_LIMIT);
+    global_State* g = L->global;
+
+    if (!g->ludatamt[tag])
+        return 0;
+
+    if (!g->ludatadirect)
+    {
+        g->ludatadirect = luaM_newarray(L, LUA_LUTAG_LIMIT, lua_UdataDirectAccessData, 0);
+        memset(g->ludatadirect, 0, LUA_LUTAG_LIMIT * sizeof(lua_UdataDirectAccessData));
+    }
+
+    return registerdirectaccess(L, g->ludatamt[tag], g->ludatadirect[tag], get, set, namecall);
+}
+
 void lua_setlightuserdataname(lua_State* L, int tag, const char* name)
 {
     api_check(L, unsigned(tag) < LUA_LUTAG_LIMIT);
@@ -2117,6 +2201,13 @@ const char* lua_getlightuserdataname(lua_State* L, int tag)
     api_check(L, unsigned(tag) < LUA_LUTAG_LIMIT);
     const TString* name = L->global->lightuserdataname[tag];
     return name ? getstr(name) : nullptr;
+}
+
+void lua_setlightuserdatalivenesscheck(lua_State* L, int tag, lua_LightUserdataLiveness check)
+{
+    api_check(L, unsigned(tag) < LUA_LUTAG_LIMIT);
+    api_check(L, !L->global->ludataliveness[tag]); // reassignment not supported
+    L->global->ludataliveness[tag] = check;
 }
 
 void lua_clonefunction(lua_State* L, int idx)
@@ -2170,6 +2261,18 @@ void lua_clonetable(lua_State* L, int idx)
 lua_Callbacks* lua_callbacks(lua_State* L)
 {
     return &L->global->cb;
+}
+
+void lua_setprethrow(lua_State* L, void (*fn)(void*), void* data)
+{
+    L->prethrow = fn;
+    L->prethrowdata = data;
+}
+
+void lua_clearprethrow(lua_State* L)
+{
+    L->prethrow = NULL;
+    L->prethrowdata = NULL;
 }
 
 void lua_setmemcat(lua_State* L, int category)

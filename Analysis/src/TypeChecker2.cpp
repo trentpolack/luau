@@ -13,6 +13,7 @@
 #include "Luau/Metamethods.h"
 #include "Luau/Normalize.h"
 #include "Luau/OverloadResolver.h"
+#include "Luau/StringUtils.h"
 #include "Luau/Subtyping.h"
 #include "Luau/TimeTrace.h"
 #include "Luau/ToString.h"
@@ -2789,6 +2790,11 @@ void TypeChecker2::visit(AstExprUnary* expr)
         // A negated integer literal is folded into one constant by the compiler, so it never negates anything.
         if (FFlag::LuauIntegerType2 && expr->expr->is<AstExprConstantInteger>())
             testIsSubtype(operandType, builtinTypes->integerType, expr->location);
+        else if (FFlag::LuauIntegerType2)
+        {
+            const TypeId numberOrInteger = module->internalTypes->addType(UnionType{{builtinTypes->numberType, builtinTypes->integerType}});
+            testIsSubtype(operandType, numberOrInteger, expr->location);
+        }
         else
             testIsSubtype(operandType, builtinTypes->numberType, expr->location);
     }
@@ -3123,6 +3129,12 @@ TypeId TypeChecker2::visit(AstExprBinary* expr, AstNode* overrideKey)
     case AstExprBinary::Op::FloorDiv:
     case AstExprBinary::Op::Pow:
     case AstExprBinary::Op::Mod:
+        if (FFlag::LuauIntegerType2 && subtyping->isSubtype(leftType, builtinTypes->integerType, scope).isSubtype)
+        {
+            testIsSubtype(rightType, builtinTypes->integerType, expr->right->location);
+            return builtinTypes->integerType;
+        }
+
         testIsSubtype(leftType, builtinTypes->numberType, expr->left->location);
         testIsSubtype(rightType, builtinTypes->numberType, expr->right->location);
 
@@ -3145,6 +3157,12 @@ TypeId TypeChecker2::visit(AstExprBinary* expr, AstNode* overrideKey)
         // if we're comparing against an uninhabited type, it's unobservable that the comparison did not run
         if (normLeft && normalizer.isInhabited(normLeft.get()) == NormalizationResult::False)
             return builtinTypes->booleanType;
+
+        if (FFlag::LuauIntegerType2 && subtyping->isSubtype(leftType, builtinTypes->integerType, scope).isSubtype)
+        {
+            testIsSubtype(rightType, builtinTypes->integerType, expr->right->location);
+            return builtinTypes->booleanType;
+        }
 
         // This could be a little wasteful, as we already have normalized
         // types, but correctly handles cases like `_: (T & number) <= _: (T & number)`.
@@ -3827,6 +3845,49 @@ void TypeChecker2::explainError(TypePackId subTy, TypePackId superTy, Location l
         reportError(TypePackMismatch{superTy, subTy, reasonings.toString()}, location);
 }
 
+static bool rejectsExtraProperties(TypeId ty)
+{
+    ty = follow(ty);
+    if (auto tt = get<TableType>(ty))
+        return tt->rejectsExtraProperties;
+
+    if (auto ut = get<UnionType>(ty))
+    {
+        for (TypeId option : ut)
+        {
+            if (rejectsExtraProperties(option))
+                return true;
+        }
+    }
+
+    return false;
+}
+
+static std::string unknownFieldMessage(const TableType& table, const std::string& key)
+{
+    std::string message = "Unknown field '" + key + "'";
+    if (table.name)
+        message += " in " + *table.name;
+
+    // Only suggest a field within a few edits of the key.
+    const std::string* closest = nullptr;
+    size_t closestDistance = std::max<size_t>(2, key.size() / 3) + 1;
+    for (const auto& [name, prop] : table.props)
+    {
+        size_t distance = editDistance(key, name);
+        if (distance < closestDistance)
+        {
+            closest = &name;
+            closestDistance = distance;
+        }
+    }
+
+    if (closest)
+        message += "; did you mean '" + *closest + "'?";
+
+    return message;
+}
+
 bool TypeChecker2::testLiteralOrAstTypeIsSubtype(AstExpr* expr, TypeId expectedType)
 {
     NotNull<Scope> scope{FFlag::LuauDontUseInnermostScope ? stack.back() : findInnermostScope_DEPRECATED(expr->location)};
@@ -3880,7 +3941,8 @@ bool TypeChecker2::testLiteralOrAstTypeIsSubtype(AstExpr* expr, TypeId expectedT
 
     SubtypingResult r = subtyping->isSubtype(exprTy, expectedType, scope);
 
-    if (r.isSubtype)
+    // Width subtyping accepts extra properties, so literals of definition-file tables still need the per-item walk.
+    if (r.isSubtype && !(expr->is<AstExprTable>() && rejectsExtraProperties(expectedType)))
         return true;
 
     return testPotentialLiteralIsSubtype(expr, expectedType);
@@ -4007,6 +4069,11 @@ bool TypeChecker2::testPotentialLiteralIsSubtype(AstExpr* expr, TypeId expectedT
 
                 if (expectedTableType->state == TableState::Exact)
                     reportError(MissingProperties{expectedType, exprType, {keyStr}, MissingProperties::Extra}, item.key->location);
+                else if (expectedTableType->rejectsExtraProperties && !expectedTableType->indexer)
+                {
+                    isSubtype = false;
+                    reportError(GenericError{unknownFieldMessage(*expectedTableType, keyStr)}, item.key->location);
+                }
 
                 // If there's not an indexer and the table is not exact, by width subtyping we can just do nothing :)
             }

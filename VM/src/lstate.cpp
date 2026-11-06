@@ -92,6 +92,8 @@ static void close_state(lua_State* L)
     luaC_freeall(L);         // collect all objects
     LUAU_ASSERT(g->strt.nuse == 0);
     luaM_freearray(L, L->global->strt.hash, L->global->strt.size, TString*, 0);
+    if (g->ludatadirect)
+        luaM_freearray(L, g->ludatadirect, LUA_LUTAG_LIMIT, lua_UdataDirectAccessData, 0);
     freestack(L, L);
     for (int i = 0; i < LUA_SIZECLASSES; i++)
     {
@@ -149,6 +151,10 @@ void lua_resetthread(lua_State* L)
 {
     api_check(L, !L->isactive);
     api_check(L, L->status != LUA_OK || L->ci == L->base_ci);
+
+    // A reset thread has no C frames left whose temporaries the handler could own.
+    L->prethrow = NULL;
+    L->prethrowdata = NULL;
 
     // close upvalues before clearing anything
     luaF_close(L, L->stack);
@@ -247,4 +253,12 @@ void lua_close(lua_State* L)
     L = L->global->mainthread; // only the main thread can be closed
     luaF_close(L, L->stack);   // close all upvalues for this thread
     close_state(L);
+}
+
+// Out of line so LTO keeps the liveness check out of every truthiness test in the interpreter loop
+LUAU_NOINLINE int luaE_lightuserdatadead(lua_State* L, const TValue* o)
+{
+    unsigned tag = unsigned(lightuserdatatag(o));
+    lua_LightUserdataLiveness check = tag < LUA_LUTAG_LIMIT ? L->global->ludataliveness[tag] : NULL;
+    return check && !check(pvalue(o));
 }
